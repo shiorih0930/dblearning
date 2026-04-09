@@ -111,35 +111,82 @@ def fetch_source_sheet(service) -> pd.DataFrame:
 
 
 # ─── Step 2: スクレイピング ──────────────────────────────────────────────────────
-def scrape_page(url: str) -> str:
-    """URLから概要文を取得する。失敗時は空文字を返す。"""
+TIMESTAMP_RE = re.compile(r'^\d+:\d+')
+
+
+def extract_toc(soup: BeautifulSoup) -> str:
+    """
+    ページから目次（タイムスタンプ付き章一覧）を取得する。
+    「0:27 〜 ICPとは」のような行をまとめて返す。
+    """
+    # タイムスタンプパターンにマッチするテキストを持つ要素を収集
+    candidates = []
+
+    # 手法1: "目次" という見出しの近隣要素を探す
+    for heading in soup.find_all(string=re.compile(r'目次')):
+        parent = heading.parent
+        # 兄弟・子要素からタイムスタンプ行を探す
+        container = parent.find_next_sibling() or parent.parent
+        if container:
+            for elem in container.find_all(string=TIMESTAMP_RE):
+                line = elem.strip()
+                if line:
+                    candidates.append(line)
+
+    # 手法2: ページ全体からタイムスタンプ行を収集
+    if not candidates:
+        for elem in soup.find_all(string=TIMESTAMP_RE):
+            line = elem.strip()
+            if line and len(line) < 100:
+                candidates.append(line)
+
+    # 手法3: liやspanなどの要素のテキストを確認
+    if not candidates:
+        for tag in ["li", "span", "p", "div"]:
+            for elem in soup.find_all(tag):
+                text = elem.get_text(strip=True)
+                if TIMESTAMP_RE.match(text) and len(text) < 100:
+                    if text not in candidates:
+                        candidates.append(text)
+
+    return "\n".join(candidates)
+
+
+def scrape_page(url: str) -> dict:
+    """URLから概要文と目次を取得する。失敗時は空文字を返す。"""
+    result = {"概要文": "", "目次": ""}
+
     if not isinstance(url, str) or not url.startswith("http"):
-        return ""
+        return result
     if TARGET_DOMAIN not in url:
-        return ""
+        return result
 
     try:
         resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 1. meta description
+        # 概要文
         meta_desc = soup.find("meta", attrs={"name": "description"})
         if meta_desc and meta_desc.get("content"):
-            return meta_desc["content"].strip()
+            result["概要文"] = meta_desc["content"].strip()
 
-        # 2. og:description
-        og_desc = soup.find("meta", property="og:description")
-        if og_desc and og_desc.get("content"):
-            return og_desc["content"].strip()
+        if not result["概要文"]:
+            og_desc = soup.find("meta", property="og:description")
+            if og_desc and og_desc.get("content"):
+                result["概要文"] = og_desc["content"].strip()
 
-        # 3. 本文先頭パラグラフ
-        for tag in ["p", "div"]:
-            elem = soup.find(tag)
-            if elem:
-                text = elem.get_text(strip=True)
-                if len(text) > 20:
-                    return text[:300]
+        if not result["概要文"]:
+            for tag in ["p", "div"]:
+                elem = soup.find(tag)
+                if elem:
+                    text = elem.get_text(strip=True)
+                    if len(text) > 20:
+                        result["概要文"] = text[:300]
+                        break
+
+        # 目次
+        result["目次"] = extract_toc(soup)
 
     except requests.exceptions.HTTPError as e:
         logger.warning(f"HTTPエラー ({e.response.status_code}): {url}")
@@ -150,12 +197,13 @@ def scrape_page(url: str) -> str:
     except Exception as e:
         logger.warning(f"予期しないエラー [{type(e).__name__}]: {url} -> {e}")
 
-    return ""
+    return result
 
 
 def scrape_all(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["概要文"] = ""
+    df["目次"] = ""
     success, fail = 0, 0
 
     for idx, row in df.iterrows():
@@ -170,14 +218,15 @@ def scrape_all(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         logger.info(f"[{idx + 1}/{len(df)}] スクレイピング中: {url}")
-        desc = scrape_page(url)
-        df.at[idx, "概要文"] = desc
+        scraped = scrape_page(url)
+        df.at[idx, "概要文"] = scraped["概要文"]
+        df.at[idx, "目次"] = scraped["目次"]
 
-        if desc:
+        if scraped["概要文"] or scraped["目次"]:
             success += 1
         else:
             fail += 1
-            logger.warning(f"  -> 概要文取得失敗")
+            logger.warning(f"  -> データ取得失敗")
 
         time.sleep(REQUEST_INTERVAL)
 
@@ -242,7 +291,7 @@ def ensure_output_sheet(service) -> int:
 
 
 def write_output_sheet(service, df: pd.DataFrame):
-    OUTPUT_COLUMNS = ["動画名", "動画URL", "コンテンツ名", "コンテンツURL", "概要文", "中カテゴリ", "小カテゴリ"]
+    OUTPUT_COLUMNS = ["動画名", "動画URL", "コンテンツ名", "コンテンツURL", "概要文", "目次", "中カテゴリ", "小カテゴリ"]
 
     ensure_output_sheet(service)
 
